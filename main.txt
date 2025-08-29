@@ -1,0 +1,197 @@
+import sys
+import ctypes
+from pathlib import Path
+import numpy as np
+import pandas as pd
+from colorama import Fore, Style, init as colorama_init
+import turtle
+import matplotlib.pyplot as plt
+
+colorama_init(autoreset=True)
+
+# Resolve paths robustly (works when run from VS Code)
+BASE_DIR = Path(__file__).parent
+FILES_DIR = BASE_DIR / "Files"
+ICON_ICO = FILES_DIR / "Taskbar_logo.ico"
+LOGO_GIF = FILES_DIR / "logo.gif"
+CRASH_GIF = FILES_DIR / "crash.gif"
+CSV_PATH = FILES_DIR / "simulated_speed_data.csv"
+
+# Optional: Set unique AppUserModelID and taskbar icon on Windows
+if sys.platform == "win32":
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            u"CrashSenseAI.VehicleCrashDetector"
+        )
+    except Exception:
+        pass
+
+# Create turtle screen
+screen = turtle.Screen()
+screen.bgcolor("black")
+try:
+    if LOGO_GIF.exists():
+        screen.bgpic(str(LOGO_GIF))
+except turtle.TurtleGraphicsError:
+    pass
+screen.title("Vehicle Crash Detection System v1.0.0")
+
+# Try to set window icon on Windows
+try:
+    if sys.platform == "win32" and ICON_ICO.exists():
+        root = screen.getcanvas().winfo_toplevel()
+        root.iconbitmap(default=str(ICON_ICO))
+except Exception:
+    pass
+
+
+def future_min_over_window(s: pd.Series, N: int) -> pd.Series:
+    # For each index i, min of s[i : i+N]
+    vals = s.astype(float).values
+    out = np.empty_like(vals, dtype=float)
+    L = len(vals)
+    for i in range(L):
+        out[i] = np.nanmin(vals[i:min(i + N, L)])
+    return pd.Series(out, index=s.index)
+
+
+def detect_crash(df: pd.DataFrame,
+                 step_drop: float = 25.0,   # km/h single-step drop
+                 min_after: float = 40.0,   # km/h speed after drop
+                 window_sec: float = 3.0,   # seconds for cumulative drop
+                 decel_ms2: float = 5.0):   # m/s^2 deceleration threshold
+    """
+    Returns a list of alerts with keys: i, timestamp, prev, curr
+    """
+    # Clean and prepare
+    s = pd.to_numeric(df['speed_kmph'], errors='coerce')
+    ts_raw = df['timestamp']
+
+    # Parse timestamps; if parsing fails, use 1-second spacing
+    ts = pd.to_datetime(ts_raw, errors='coerce')
+    if ts.isna().all():
+        # Treat as numeric seconds if possible, else 1-second steps
+        numeric_ts = pd.to_numeric(ts_raw, errors='coerce')
+        if numeric_ts.notna().any():
+            ts = pd.to_datetime(numeric_ts - numeric_ts.iloc[0], unit='s', origin='unix')
+        else:
+            ts = pd.date_range(start="2025-01-01 00:00:00", periods=len(s), freq="1S")
+
+    # Sort by time
+    df_clean = pd.DataFrame({'timestamp': ts, 'speed_kmph': s}).sort_values('timestamp').reset_index(drop=True)
+    s = df_clean['speed_kmph'].interpolate().bfill().astype(float)
+    ts = df_clean['timestamp']
+
+    # Estimate median dt (s)
+    dt_series = ts.diff().dt.total_seconds()
+    dt_med = float(dt_series[dt_series > 0].median() or 1.0)
+    N = max(2, int(round(window_sec / max(dt_med, 1e-9))))
+
+    # A) One-step sudden drop
+    drop1 = s.shift(1) - s
+    cond1 = (drop1 >= step_drop) & (s <= min_after)
+
+    # B) Cumulative drop within window_sec
+    future_min = future_min_over_window(s, N)
+    dropN = s - future_min
+    cond2 = (dropN >= step_drop) & (future_min <= min_after)
+
+    # C) High deceleration (negative acceleration in m/s^2)
+    v_ms = s * (1000.0 / 3600.0)
+    dts = dt_series.replace(0, np.nan).fillna(method='bfill').fillna(dt_med)
+    a = v_ms.diff() / dts
+    cond3 = (a <= -decel_ms2)
+
+    # Combine conditions
+    cond = (cond1 | cond2 | cond3).fillna(False)
+
+    # Event starts to avoid duplicates
+    starts = cond & ~cond.shift(1, fill_value=False)
+    idxs = list(np.where(starts.values)[0])
+
+    alerts = []
+    for i in idxs:
+        prev = float(s.iloc[i - 1]) if i > 0 else float('nan')
+        curr = float(s.iloc[i])
+        alerts.append({
+            'i': int(i),
+            'timestamp': ts.iloc[i],
+            'prev': prev,
+            'curr': curr
+        })
+    return alerts, df_clean
+
+
+def transition():
+    # Switch background to crash UI
+    screen.clear()
+    try:
+        if CRASH_GIF.exists():
+            screen.bgpic(str(CRASH_GIF))
+    except turtle.TurtleGraphicsError:
+        pass
+    screen.title("Vehicle Crash Detection System v1.0.0")
+
+    if not CSV_PATH.exists():
+        print(Fore.RED + f"CSV not found at: {CSV_PATH}")
+        sys.exit(1)
+
+    # Load and detect BEFORE showing the matplotlib window
+    try:
+        df = pd.read_csv(CSV_PATH)
+    except Exception as e:
+        print(Fore.RED + f"Error reading CSV: {e}")
+        sys.exit(1)
+
+    alerts, df_clean = detect_crash(
+        df,
+        step_drop=25.0,   # tune as needed: 20–30 works well for demos
+        min_after=40.0,
+        window_sec=3.0,
+        decel_ms2=5.0
+    )
+
+    # Turtle overlay messages
+    pen = turtle.Turtle()
+    pen.hideturtle()
+    pen.penup()
+    pen.color((1.0, 0.0, 0.0824))  # red
+    pen.speed(0)
+
+    line_spacing = 30
+    if alerts:
+        y = 200
+        for a in alerts:
+            ts = a['timestamp']
+            prev, curr = a['prev'], a['curr']
+            msg1 = f"Crash suspected at {ts}"
+            msg2 = f"Speed dropped from {prev:.1f} to {curr:.1f} km/h"
+            pen.goto(0, y); pen.write(msg1, align="center", font=("Arial", 24, "bold"))
+            y -= line_spacing
+            pen.goto(0, y); pen.write(msg2, align="center", font=("Arial", 14, "normal"))
+            y -= line_spacing * 2
+    else:
+        safe_msg = "No abnormal speed drops detected"
+        print(Fore.GREEN + safe_msg + Style.RESET_ALL)
+        pen.goto(0, 0)
+        pen.write(safe_msg, align="center", font=("Arial", 26, "bold"))
+
+    # Plot speed and annotate detected events
+    plt.figure(figsize=(10, 5))
+    plt.plot(df_clean['timestamp'], df_clean['speed_kmph'],
+             marker='o', linestyle='-', linewidth=2, label='Speed')
+    for a in alerts:
+        plt.axvline(x=a['timestamp'], color='red', linestyle='--', alpha=0.5)
+    plt.title('Vehicle Speed Over Time')
+    plt.xlabel('Timestamp')
+    plt.ylabel('Speed (km/h)')
+    plt.grid(True)
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.legend()
+    plt.show()
+
+
+# Start the UI, then trigger transition after 4.5s
+screen.ontimer(transition, 4500)
+screen.mainloop()
